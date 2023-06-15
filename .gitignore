@@ -34,3 +34,5 @@ install.sh
 \#*\#
 .\#*
 
+# documentation wesite asset folder
+docs/_site
