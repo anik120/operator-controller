@@ -1,20 +1,22 @@
 package storage
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/singleflight"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/operator-framework/operator-registry/alpha/declcfg"
@@ -31,14 +33,6 @@ type LocalDirV1 struct {
 	EnableMetasHandler bool
 
 	m sync.RWMutex
-	// this singleflight Group is used in `getIndex()`` to handle concurrent HTTP requests
-	// optimally. With the use of this slightflight group, the index is loaded from disk
-	// once per concurrent group of HTTP requests being handled by the metas handler.
-	// The single flight instance gives us a way to load the index from disk exactly once
-	// per concurrent group of callers, and then let every concurrent caller have access to
-	// the loaded index. This avoids lots of unnecessary open/decode/close cycles when concurrent
-	// requests are being handled, which improves overall performance and decreases response latency.
-	sf singleflight.Group
 }
 
 var (
@@ -127,14 +121,16 @@ func (s *LocalDirV1) ContentExists(catalog string) bool {
 	}
 
 	if s.EnableMetasHandler {
-		indexFileStat, err := os.Stat(catalogIndexFilePath(s.catalogDir(catalog)))
+		// Check for index metadata file instead of the old index file
+		metaFileStat, err := os.Stat(filepath.Join(s.catalogDir(catalog), "index.meta.json"))
 		if err != nil {
 			return false
 		}
-		if !indexFileStat.Mode().IsRegular() {
+		if !metaFileStat.Mode().IsRegular() {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -157,28 +153,154 @@ func storeCatalogData(catalogDir string, metas <-chan *declcfg.Meta) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// Use a buffered writer for efficient writing
+	bufWriter := bufio.NewWriter(f)
+	defer func() {
+		// Drain the channel to prevent producer goroutine from blocking
+		// if we had an error during processing
+		for range metas {
+			// Just drain, don't process
+		}
 
+		bufWriter.Flush() // Flush any remaining buffered data
+		f.Sync()          // Ensure data is committed to disk
+		f.Close()         // Close the file
+	}()
+
+	// Process the channel
 	for m := range metas {
-		if _, err := f.Write(m.Blob); err != nil {
+		if _, err := bufWriter.Write(m.Blob); err != nil {
 			return err
+		}
+
+		// Periodically flush to avoid excessive memory usage
+		if bufWriter.Buffered() > 1024*1024 { // 1MB threshold
+			if err := bufWriter.Flush(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
+// storeIndexData stores the index data with batching
+// storeIndexData processes metas and stores them in batches on disk
 func storeIndexData(catalogDir string, metas <-chan *declcfg.Meta) error {
-	idx := newIndex(metas)
-
-	f, err := os.Create(catalogIndexFilePath(catalogDir))
-	if err != nil {
-		return err
+	idx := &diskIndex{
+		catalogDir: catalogDir,
+		meta: &indexMetadata{
+			SchemaKeys:  make(map[string][]int),
+			PackageKeys: make(map[string][]int),
+			NameKeys:    make(map[string][]int),
+		},
 	}
-	defer f.Close()
 
-	enc := json.NewEncoder(f)
-	enc.SetEscapeHTML(false)
-	return enc.Encode(idx)
+	currentBatch := &batchFile{
+		Sections: make(map[string][]section),
+	}
+
+	batchNum := 0
+	count := 0
+	offset := int64(0)
+
+	// Track which keys are in the current batch
+	schemaKeysInBatch := make(map[string]bool)
+	packageKeysInBatch := make(map[string]bool)
+	nameKeysInBatch := make(map[string]bool)
+
+	// Function to write the current batch to disk and start a new one
+	writeBatch := func(batchNum int) error {
+		// Update metadata
+		for schema := range schemaKeysInBatch {
+			idx.meta.SchemaKeys[schema] = append(idx.meta.SchemaKeys[schema], batchNum)
+		}
+		for pkg := range packageKeysInBatch {
+			idx.meta.PackageKeys[pkg] = append(idx.meta.PackageKeys[pkg], batchNum)
+		}
+		for name := range nameKeysInBatch {
+			idx.meta.NameKeys[name] = append(idx.meta.NameKeys[name], batchNum)
+		}
+
+		// Write batch to disk
+		batchPath := idx.getBatchPath(batchNum)
+		f, err := os.Create(batchPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		enc := json.NewEncoder(f)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(currentBatch); err != nil {
+			return err
+		}
+
+		// Increment batch counter and reset for next batch
+		batchNum++
+		idx.meta.BatchCount = batchNum
+
+		// Reset tracking
+		currentBatch = &batchFile{
+			Sections: make(map[string][]section),
+		}
+		schemaKeysInBatch = make(map[string]bool)
+		packageKeysInBatch = make(map[string]bool)
+		nameKeysInBatch = make(map[string]bool)
+		count = 0
+
+		return nil
+	}
+
+	for meta := range metas {
+		start := offset
+		length := int64(len(meta.Blob))
+		offset += length
+		s := section{Offset: start, Length: length}
+
+		// Add to schema index
+		if meta.Schema != "" {
+			if _, ok := currentBatch.Sections[meta.Schema]; !ok {
+				currentBatch.Sections[meta.Schema] = []section{}
+			}
+			currentBatch.Sections[meta.Schema] = append(currentBatch.Sections[meta.Schema], s)
+			schemaKeysInBatch[meta.Schema] = true
+		}
+
+		// Add to package index
+		if meta.Package != "" {
+			if _, ok := currentBatch.Sections[meta.Package]; !ok {
+				currentBatch.Sections[meta.Package] = []section{}
+			}
+			currentBatch.Sections[meta.Package] = append(currentBatch.Sections[meta.Package], s)
+			packageKeysInBatch[meta.Package] = true
+		}
+
+		// Add to name index
+		if meta.Name != "" {
+			if _, ok := currentBatch.Sections[meta.Name]; !ok {
+				currentBatch.Sections[meta.Name] = []section{}
+			}
+			currentBatch.Sections[meta.Name] = append(currentBatch.Sections[meta.Name], s)
+			nameKeysInBatch[meta.Name] = true
+		}
+
+		count++
+		if count >= BatchSize {
+			if err := writeBatch(batchNum); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Write final batch if there's any data
+	if count > 0 {
+		if err := writeBatch(batchNum); err != nil {
+			return err
+		}
+	}
+
+	// Save metadata
+	return idx.saveMetadata()
 }
 
 func (s *LocalDirV1) BaseURL(catalog string) string {
@@ -260,7 +382,7 @@ func (s *LocalDirV1) handleV1Metas(w http.ResponseWriter, r *http.Request) {
 		serveJSONLines(w, r, catalogFile)
 		return
 	}
-	idx, err := s.getIndex(catalog)
+	idx, err := s.loadIndex(catalog)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -298,33 +420,97 @@ func httpError(w http.ResponseWriter, err error) {
 
 func serveJSONLines(w http.ResponseWriter, r *http.Request, rs io.Reader) {
 	w.Header().Add("Content-Type", "application/jsonl")
-	// Copy the content of the reader to the response writer
-	// only if it's a Get request
+
+	// Return early for HEAD requests
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, err := io.Copy(w, rs)
-	if err != nil {
-		httpError(w, err)
-		return
+
+	// Set appropriate headers for streaming
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	// Use a buffered writer to improve performance
+	bufWriter := bufio.NewWriterSize(w, 64*1024) // 64KB buffer
+
+	// Create a copy operation that can be canceled
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// Use the request context for cancellation
+		ctx := r.Context()
+
+		// Create a buffer that will be reused
+		buf := make([]byte, 32*1024) // 32KB buffer
+
+		for {
+			// Check if the client has disconnected
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				// Continue with copy
+			}
+
+			// Read a chunk
+			nr, readErr := rs.Read(buf)
+			if nr > 0 {
+				// Write the chunk
+				_, writeErr := bufWriter.Write(buf[:nr])
+				if writeErr != nil {
+					return
+				}
+
+				// Flush periodically to avoid keeping too much in memory
+				if bufWriter.Buffered() > 32*1024 {
+					if flushErr := bufWriter.Flush(); flushErr != nil {
+						return
+					}
+				}
+			}
+
+			if readErr != nil {
+				if readErr != io.EOF {
+					httpError(w, readErr)
+				}
+				break
+			}
+		}
+
+		// Final flush
+		bufWriter.Flush()
+	}()
+
+	// Wait for completion or timeout
+	select {
+	case <-done:
+		// Copy completed normally
+	case <-time.After(5 * time.Minute): // Reasonable timeout
+		// Log timeout but don't return an error to the client as headers are already sent
+		log.Printf("Response timeout for large content stream")
 	}
 }
 
-func (s *LocalDirV1) getIndex(catalog string) (*index, error) {
-	idx, err, _ := s.sf.Do(catalog, func() (interface{}, error) {
-		indexFile, err := os.Open(catalogIndexFilePath(s.catalogDir(catalog)))
-		if err != nil {
-			return nil, err
-		}
-		defer indexFile.Close()
-		var idx index
-		if err := json.NewDecoder(indexFile).Decode(&idx); err != nil {
-			return nil, err
-		}
-		return &idx, nil
-	})
+// loadIndex loads an index from disk
+func (s *LocalDirV1) loadIndex(catalog string) (*diskIndex, error) {
+	idx := &diskIndex{
+		catalogDir: s.catalogDir(catalog),
+	}
+
+	// Load metadata
+	metaPath := idx.getMetadataPath()
+	f, err := os.Open(metaPath)
 	if err != nil {
 		return nil, err
 	}
-	return idx.(*index), nil
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	idx.meta = &indexMetadata{}
+	if err := dec.Decode(idx.meta); err != nil {
+		return nil, err
+	}
+
+	return idx, nil
 }
