@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/containers/image/v5/docker/reference"
+	"go.opentelemetry.io/otel"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -91,6 +92,10 @@ func (r *ClusterCatalogReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	l.Info("reconcile starting")
 	defer l.Info("reconcile ending")
+
+	tracer := otel.Tracer("catalogd")
+	ctx, span := tracer.Start(ctx, "ClusterCatalog Reconciler")
+	defer span.End()
 
 	existingCatsrc := ocv1.ClusterCatalog{}
 	if err := r.Client.Get(ctx, req.NamespacedName, &existingCatsrc); err != nil {

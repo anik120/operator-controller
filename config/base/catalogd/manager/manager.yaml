@@ -49,6 +49,13 @@ spec:
         - --external-address=catalogd-service.olmv1-system.svc
         image: controller:latest
         name: manager
+        env:
+        - name: SERVICE_NAME
+          value: "olmv1-system-catalogd-service"
+        - name: INSECURE_MODE
+          value: "true"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "signoz-otel-collector.monitoring.svc.cluster.local:4317"
         volumeMounts:
             - name: cache
               mountPath: /var/cache/
