@@ -1,7 +1,6 @@
 package convert_test
 
 import (
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -24,6 +23,8 @@ import (
 	"github.com/operator-framework/operator-registry/alpha/property"
 
 	"github.com/operator-framework/operator-controller/internal/operator-controller/rukpak/convert"
+	"github.com/operator-framework/operator-controller/internal/operator-controller/rukpak/render"
+	"github.com/operator-framework/operator-controller/internal/operator-controller/rukpak/render/validators"
 )
 
 const (
@@ -53,22 +54,8 @@ func getCsvAndService() (v1alpha1.ClusterServiceVersion, corev1.Service) {
 	return csv, svc
 }
 
-func TestConverterValidatesBundle(t *testing.T) {
-	converter := convert.Converter{
-		BundleValidator: []func(rv1 *convert.RegistryV1) []error{
-			func(rv1 *convert.RegistryV1) []error {
-				return []error{errors.New("test error")}
-			},
-		},
-	}
-
-	_, err := converter.Convert(convert.RegistryV1{}, "installNamespace", []string{"watchNamespace"})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "test error")
-}
-
 func TestPlainConverterUsedRegV1Validator(t *testing.T) {
-	require.Equal(t, convert.RegistryV1BundleValidator, convert.PlainConverter.BundleValidator)
+	require.Equal(t, validators.RegistryV1BundleValidator, convert.PlainConverter.BundleValidator)
 }
 
 func TestRegistryV1SuiteNamespaceNotAvailable(t *testing.T) {
@@ -82,7 +69,7 @@ func TestRegistryV1SuiteNamespaceNotAvailable(t *testing.T) {
 	csv, svc := getCsvAndService()
 
 	unstructuredSvc := convertToUnstructured(t, svc)
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         csv,
 		Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -116,7 +103,7 @@ func TestRegistryV1SuiteNamespaceAvailable(t *testing.T) {
 	unstructuredSvc := convertToUnstructured(t, svc)
 	unstructuredSvc.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"})
 
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         csv,
 		Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -157,7 +144,7 @@ func TestRegistryV1SuiteNamespaceUnsupportedKind(t *testing.T) {
 	unstructuredEvt := convertToUnstructured(t, event)
 	unstructuredEvt.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Event"})
 
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         csv,
 		Others:      []unstructured.Unstructured{unstructuredEvt},
@@ -191,7 +178,7 @@ func TestRegistryV1SuiteNamespaceClusterScoped(t *testing.T) {
 	unstructuredpriorityclass := convertToUnstructured(t, pc)
 	unstructuredpriorityclass.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PriorityClass"})
 
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         csv,
 		Others:      []unstructured.Unstructured{unstructuredpriorityclass},
@@ -278,7 +265,7 @@ func TestRegistryV1SuiteGenerateAllNamespace(t *testing.T) {
 	t.Log("By creating a registry v1 bundle")
 	watchNamespaces := []string{""}
 	unstructuredSvc := convertToUnstructured(t, svc)
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         *csv,
 		Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -311,7 +298,7 @@ func TestRegistryV1SuiteGenerateMultiNamespace(t *testing.T) {
 	t.Log("By creating a registry v1 bundle")
 	watchNamespaces := []string{"testWatchNs1", "testWatchNs2"}
 	unstructuredSvc := convertToUnstructured(t, svc)
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         *csv,
 		Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -344,7 +331,7 @@ func TestRegistryV1SuiteGenerateSingleNamespace(t *testing.T) {
 	t.Log("By creating a registry v1 bundle")
 	watchNamespaces := []string{"testWatchNs1"}
 	unstructuredSvc := convertToUnstructured(t, svc)
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         *csv,
 		Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -377,7 +364,7 @@ func TestRegistryV1SuiteGenerateOwnNamespace(t *testing.T) {
 	t.Log("By creating a registry v1 bundle")
 	watchNamespaces := []string{installNamespace}
 	unstructuredSvc := convertToUnstructured(t, svc)
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         *csv,
 		Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -482,7 +469,7 @@ func TestConvertInstallModeValidation(t *testing.T) {
 
 			t.Log("By creating a registry v1 bundle")
 			unstructuredSvc := convertToUnstructured(t, svc)
-			registryv1Bundle := convert.RegistryV1{
+			registryv1Bundle := render.RegistryV1{
 				PackageName: "testPkg",
 				CSV:         *csv,
 				Others:      []unstructured.Unstructured{unstructuredSvc},
@@ -572,7 +559,7 @@ func TestRegistryV1SuiteGenerateNoWebhooks(t *testing.T) {
 		},
 	}
 	watchNamespaces := []string{metav1.NamespaceAll}
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         csv,
 	}
@@ -603,7 +590,7 @@ func TestRegistryV1SuiteGenerateNoAPISerciceDefinitions(t *testing.T) {
 		},
 	}
 	watchNamespaces := []string{metav1.NamespaceAll}
-	registryv1Bundle := convert.RegistryV1{
+	registryv1Bundle := render.RegistryV1{
 		PackageName: "testPkg",
 		CSV:         csv,
 	}
